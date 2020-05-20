@@ -1,30 +1,34 @@
-import torch
 import torch.nn as nn
+import torch.utils.model_zoo as model_zoo
+from ..builder import BACKBONES
 import torch.nn.functional as F
 import numpy as np
-import time
+import torch
 from mmdet.utils import get_root_logger
 from mmcv.runner import load_checkpoint
 
-from ..builder import BACKBONES
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
 
-class even_Downsample(nn.Module):
-    def __init__(self, channels, filt_size=3, stride=2):
-        super(even_Downsample, self).__init__()
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+class Downsample(nn.Module):
+    def __init__(self, pad_type='reflect', filt_size=3, stride=2, channels=None, pad_off=0):
+        super(Downsample, self).__init__()
         self.filt_size = filt_size
+        self.pad_off = pad_off
+        self.pad_sizes = [int(1.*(filt_size-1)/2), int(np.ceil(1.*(filt_size-1)/2)), int(1.*(filt_size-1)/2), int(np.ceil(1.*(filt_size-1)/2))]
+        self.pad_sizes = [pad_size+pad_off for pad_size in self.pad_sizes]
         self.stride = stride
+        self.off = int((self.stride-1)/2.)
         self.channels = channels
 
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Sequential(
-            nn.Conv2d(4*channels, channels, kernel_size=1),
-            nn.ReLU()
-        )
-        self.fc2 = nn.Sequential(
-            nn.Conv2d(channels, 4*channels, kernel_size = 1),
-            nn.Sigmoid()
-        )
-
+        # print('Filter size [%i]'%filt_size)
         if(self.filt_size==1):
             a = np.array([1.,])
         elif(self.filt_size==2):
@@ -39,85 +43,75 @@ class even_Downsample(nn.Module):
             a = np.array([1., 5., 10., 10., 5., 1.])
         elif(self.filt_size==7):    
             a = np.array([1., 6., 15., 20., 15., 6., 1.])
-            
+
         filt = torch.Tensor(a[:,None]*a[None,:])
         filt = filt/torch.sum(filt)
-        self.register_buffer('filt', filt[None,None,:,:].repeat((4*channels,1,1,1)))
+        self.register_buffer('filt', filt[None,None,:,:].repeat((self.channels,1,1,1)))
 
-    def forward(self, x):
-        b,c,h,w = x.size()
-        part1 = F.pad(x,(1,0,1,0),mode = "reflect")
-        part2 = F.pad(x,(1,0,0,1),mode = "reflect")
-        part3 = F.pad(x,(0,1,1,0),mode = "reflect")
-        part4 = F.pad(x,(0,1,0,1),mode = "reflect")
+        self.pad = get_pad_layer(pad_type)(self.pad_sizes)
 
-        x = torch.cat((part1,part2,part3,part4),1)
-        x = F.conv2d(x, self.filt, stride=2, groups=4*c) 
-        x = x.reshape(b, 4, c, h//2, w//2)
-        x = x.permute(0, 2, 1, 3, 4)
-        x = x.reshape(b, 4*c, h//2, w//2)
-        
-        out = self.avgpool(x)   # b 4c  1   1
-        out = self.fc1(out)     # b c   1   1
-        out = self.fc2(out)     # b 4c  1   1
-
-        x = x * out
-        x = x.reshape(b, c, 4, h//2, w//2)
-        x = torch.sum(x, 2)
-
-        return x
-
-def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=dilation, groups=groups, bias=False, dilation=dilation)
-
-def conv1x1(in_planes, out_planes, stride=1):
-    """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
-
-class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
-        super(BasicBlock, self).__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        if groups != 1 or base_width != 64:
-            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
-        if dilation > 1:
-            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
-        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
-        self.conv1 = conv3x3(inplanes, planes)
-        self.bn1 = norm_layer(planes)
-        self.relu = nn.ReLU(inplace=True)
-        if(stride==1):
-            self.conv2 = conv3x3(planes,planes)
+    def forward(self, inp):
+        if(self.filt_size==1):
+            if(self.pad_off==0):
+                return inp[:,:,::self.stride,::self.stride]    
+            else:
+                return self.pad(inp)[:,:,::self.stride,::self.stride]
         else:
-            self.conv2 = nn.Sequential(even_Downsample(planes, filt_size=3, stride=stride),
-                conv3x3(planes, planes),)
-        self.bn2 = norm_layer(planes)
-        self.downsample = downsample
-        self.stride = stride
+            return F.conv2d(self.pad(inp), self.filt, stride=self.stride, groups=inp.shape[1])
 
-    def forward(self, x):
-        identity = x
+def get_pad_layer(pad_type):
+    if(pad_type in ['refl','reflect']):
+        PadLayer = nn.ReflectionPad2d
+    elif(pad_type in ['repl','replicate']):
+        PadLayer = nn.ReplicationPad2d
+    elif(pad_type=='zero'):
+        PadLayer = nn.ZeroPad2d
+    else:
+        print('Pad type [%s] not recognized'%pad_type)
+    return PadLayer
 
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
+# class BasicBlock(nn.Module):
+#     expansion = 1
 
-        out = self.conv2(out)
-        out = self.bn2(out)
+#     def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+#                  base_width=64, dilation=1, norm_layer=None):
+#         super(BasicBlock, self).__init__()
+#         if norm_layer is None:
+#             norm_layer = nn.BatchNorm2d
+#         if groups != 1 or base_width != 64:
+#             raise ValueError('BasicBlock only supports groups=1 and base_width=64')
+#         if dilation > 1:
+#             raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+#         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+#         self.conv1 = conv3x3(inplanes, planes)
+#         self.bn1 = norm_layer(planes)
+#         self.relu = nn.ReLU(inplace=True)
+#         if(stride==1):
+#             self.conv2 = conv3x3(planes,planes)
+#         else:
+#             self.conv2 = nn.Sequential(even_Downsample(planes, filt_size=3, stride=stride),
+#                 conv3x3(planes, planes),)
+#         self.bn2 = norm_layer(planes)
+#         self.downsample = downsample
+#         self.stride = stride
 
-        if self.downsample is not None:
-            identity = self.downsample(x)
+#     def forward(self, x):
+#         identity = x
 
-        out += identity
-        out = self.relu(out)
+#         out = self.conv1(x)
+#         out = self.bn1(out)
+#         out = self.relu(out)
 
-        return out
+#         out = self.conv2(out)
+#         out = self.bn2(out)
+
+#         if self.downsample is not None:
+#             identity = self.downsample(x)
+
+#         out += identity
+#         out = self.relu(out)
+
+#         return out
 
 
 class Bottleneck(nn.Module):
@@ -133,7 +127,7 @@ class Bottleneck(nn.Module):
         self.conv1 = conv1x1(inplanes, width)
         self.bn1 = norm_layer(width)
         if stride == 2:
-            self.conv2 = even_Downsample(channels=width, filt_size=3, stride = stride)
+            self.conv2 = Downsample(filt_size=3, stride = stride, channels=width,)
         else:
             self.conv2 = conv3x3(width, width, stride, groups, dilation)
         self.bn2 = norm_layer(width)
@@ -166,28 +160,19 @@ class Bottleneck(nn.Module):
         return out
 
 @BACKBONES.register_module()
-class ResNet_ds(nn.Module):
+class ResNet_blur_ref_ds(nn.Module):
 
-    def __init__(self, depth, zero_init_residual=False, groups=1, width_per_group=64, replace_stride_with_dilation=None, norm_layer=None):
-        super(ResNet_ds, self).__init__()
-        if depth == 18:
-            block = BasicBlock
-            layers = [2, 2, 2, 2]
-        elif depth == 34:
-            block = BasicBlock
-            layers = [3, 4, 6, 3]
-        elif depth == 50:
-            block = Bottleneck
-            layers = [3, 4, 6, 3]
-        elif depth == 101:
-            block = Bottleneck
-            layers = [3, 4, 23, 3]
+    def __init__(self,depth=50, block=Bottleneck, layers=[3, 4, 6, 3], zero_init_residual=False,
+                 groups=1, width_per_group=64, replace_stride_with_dilation=None,
+                 norm_layer=None):
+        super(ResNet_blur_ref_ds, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
-        self.zero_init_residual = zero_init_residual
+
         self.inplanes = 64
         self.dilation = 1
+        self.zero_init_residual = zero_init_residual
         if replace_stride_with_dilation is None:
             # each element in the tuple indicates if we should replace
             # the 2x2 stride with a dilated convolution instead
@@ -202,7 +187,7 @@ class ResNet_ds(nn.Module):
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         # self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.maxpool = even_Downsample(self.inplanes, filt_size = 3, stride = 2)
+        self.maxpool = Downsample(filt_size = 3, stride = 2, channels=self.inplanes)
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
@@ -246,14 +231,13 @@ class ResNet_ds(nn.Module):
         if self.inplanes != planes * block.expansion:
             if stride != 1:
                 downsample = nn.Sequential(
-                    even_Downsample(self.inplanes, filt_size=3, stride=2),
-                    norm_layer(self.inplanes,),
+                    Downsample(filt_size=3, stride=2, channels=self.inplanes),
                     conv1x1(self.inplanes, planes * block.expansion, 1),
                     norm_layer(planes * block.expansion),
                 )
             else:
                 downsample = nn.Sequential(
-                    conv1x1(self.inplanes, planes * block.expansion, stride),
+                    conv1x1(self.inplanes, planes * block.expansion, 1),
                     norm_layer(planes * block.expansion),
                 )
 
@@ -280,29 +264,31 @@ class ResNet_ds(nn.Module):
         p4 = self.layer4(p3)
 
         out = [p1,p2,p3,p4]
+
         # x = self.avgpool(x)
-        # x = torch.flatten(x, 1)
+        # x = x.view(x.size(0), -1)
         # x = self.fc(x)
 
         return out
 
+
 # def _resnet(arch, block, layers, **kwargs):
-#     model = ResNet_ds(block, layers, **kwargs)
+#     model = ResNet_blur_ref_ds(block, layers, **kwargs)
 #     return model
 
-# @BACKBONES.register_module()
+
 # def resnet18_ds(**kwargs):
 #     return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], **kwargs)
 
-# @BACKBONES.register_module()
+
 # def resnet34_ds( **kwargs):
 #     return _resnet('resnet34', BasicBlock, [3, 4, 6, 3], **kwargs)
 
-# @BACKBONES.register_module()
-# def resnet50_ds(**kwargs):
+
+# def resnet50_blur_ref_ds(**kwargs):
 #     return _resnet('resnet50', Bottleneck, [3, 4, 6, 3], **kwargs)
 
-# # @BACKBONES.register_module()
+
 # def resnet101_ds(**kwargs):
 #     return _resnet('resnet101', Bottleneck, [3, 4, 23, 3], **kwargs)
 

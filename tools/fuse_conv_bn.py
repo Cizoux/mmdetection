@@ -61,7 +61,7 @@ def main():
     model = init_detector(args.config, args.checkpoint)
     # fuse conv and bn layers of the model
     fused_model = fuse_module(model)
-    save_checkpoint(fused_model, args.out)
+    save_checkpoint(fused_model, args.out, create_symlink = False)
 
 
 if __name__ == '__main__':

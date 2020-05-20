@@ -4,6 +4,8 @@ from ..builder import BACKBONES
 import torch.nn.functional as F
 import numpy as np
 import torch
+from mmdet.utils import get_root_logger
+from mmcv.runner import load_checkpoint
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101']
 
 
@@ -200,16 +202,17 @@ class ResNet_blur(nn.Module):
         # self.fc = nn.Linear(planes[3] * block.expansion, num_classes)
         
     def init_weights(self, pretrained=None):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                if(m.in_channels!=m.out_channels or m.out_channels!=m.groups or m.bias is not None):
-                    # don't want to reinitialize downsample layers, code assuming normal conv layers will not have these characteristics
+        if isinstance(pretrained, str):
+            logger = get_root_logger()
+            load_checkpoint(self, pretrained, strict=False, logger=logger)
+
+        elif pretrained is None:
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d):
                     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                else:
-                    print('Not initializing')
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+                elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
 
         # Zero-initialize the last BN in each residual branch,
         # so that the residual branch starts with zeros, and each residual block behaves like an identity.
