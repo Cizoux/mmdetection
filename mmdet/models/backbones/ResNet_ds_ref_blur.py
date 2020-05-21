@@ -301,7 +301,7 @@ class ResNet_ds_ref_blur(nn.Module):
         return out
 
     def train(self, mode=True):
-        super(ResNet_ds, self).train(mode)
+        super(ResNet_ds_ref_blur, self).train(mode)
         self._freeze_stages()
         if mode and self.norm_eval:
             for m in self.modules():
