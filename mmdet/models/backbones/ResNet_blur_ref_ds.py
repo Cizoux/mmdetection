@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from mmdet.utils import get_root_logger
 from mmcv.runner import load_checkpoint
+from torch.nn.modules.batchnorm import _BatchNorm
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     """3x3 convolution with padding"""
@@ -162,14 +163,15 @@ class Bottleneck(nn.Module):
 @BACKBONES.register_module()
 class ResNet_blur_ref_ds(nn.Module):
 
-    def __init__(self,depth=50, block=Bottleneck, layers=[3, 4, 6, 3], zero_init_residual=False,
+    def __init__(self, depth=50, norm_eval=True, frozen_stages=-1, block=Bottleneck, layers=[3, 4, 6, 3], zero_init_residual=False,
                  groups=1, width_per_group=64, replace_stride_with_dilation=None,
                  norm_layer=None):
         super(ResNet_blur_ref_ds, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
-
+        self.norm_eval = norm_eval
+        self.frozen_stages = frozen_stages
         self.inplanes = 64
         self.dilation = 1
         self.zero_init_residual = zero_init_residual
@@ -197,6 +199,18 @@ class ResNet_blur_ref_ds(nn.Module):
                                        dilate=replace_stride_with_dilation[2])
         # self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         # self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self._freeze_stages()
+
+    def _freeze_stages(self):
+        if self.frozen_stages >= 0:
+            self.conv1.requires_grad = False
+            self.maxpool.requires_grad =False
+
+        for i in range(1, self.frozen_stages + 1):
+            m = getattr(self, f'layer{i}')
+            m.eval()
+            for param in m.parameters():
+                param.requires_grad = False
 
     def init_weights(self, pretrained=None):
         if isinstance(pretrained, str):
@@ -271,24 +285,11 @@ class ResNet_blur_ref_ds(nn.Module):
 
         return out
 
-
-# def _resnet(arch, block, layers, **kwargs):
-#     model = ResNet_blur_ref_ds(block, layers, **kwargs)
-#     return model
-
-
-# def resnet18_ds(**kwargs):
-#     return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], **kwargs)
-
-
-# def resnet34_ds( **kwargs):
-#     return _resnet('resnet34', BasicBlock, [3, 4, 6, 3], **kwargs)
-
-
-# def resnet50_blur_ref_ds(**kwargs):
-#     return _resnet('resnet50', Bottleneck, [3, 4, 6, 3], **kwargs)
-
-
-# def resnet101_ds(**kwargs):
-#     return _resnet('resnet101', Bottleneck, [3, 4, 23, 3], **kwargs)
-
+    def train(self, mode=True):
+        super(ResNet_ds, self).train(mode)
+        self._freeze_stages()
+        if mode and self.norm_eval:
+            for m in self.modules():
+                # trick: eval have effect on BatchNorm only
+                if isinstance(m, _BatchNorm):
+                    m.eval()

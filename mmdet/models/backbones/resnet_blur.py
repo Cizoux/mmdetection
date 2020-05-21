@@ -1,11 +1,13 @@
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
-from ..builder import BACKBONES
 import torch.nn.functional as F
 import numpy as np
 import torch
 from mmdet.utils import get_root_logger
 from mmcv.runner import load_checkpoint
+from torch.nn.modules.batchnorm import _BatchNorm
+
+from ..builder import BACKBONES
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101']
 
 
@@ -158,7 +160,7 @@ class Bottleneck(nn.Module):
 
 @BACKBONES.register_module()
 class ResNet_blur(nn.Module):
-    def __init__(self, depth, zero_init_residual=False, groups=1, width_per_group=64, norm_layer=None, filter_size=3, pool_only=True):
+    def __init__(self, depth, norm_eval=True, frozen_stages=-1, zero_init_residual=False, groups=1, width_per_group=64, norm_layer=None, filter_size=3, pool_only=True):
         super(ResNet_blur, self).__init__()
         if depth == 18:
             block = BasicBlock
@@ -176,6 +178,8 @@ class ResNet_blur(nn.Module):
         self.zero_init_residual = zero_init_residual
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
+        self.norm_eval = norm_eval
+        self.frozen_stages = frozen_stages
         planes = [int(width_per_group * groups * 2 ** i) for i in range(4)]
         self.inplanes = planes[0]
 
@@ -200,7 +204,19 @@ class ResNet_blur(nn.Module):
         self.layer4 = self._make_layer(block, planes[3], layers[3], stride=2, groups=groups, norm_layer=norm_layer, filter_size=filter_size)
         # self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         # self.fc = nn.Linear(planes[3] * block.expansion, num_classes)
-        
+        self._freeze_stages()
+
+    def _freeze_stages(self):
+        if self.frozen_stages >= 0:
+            self.conv1.requires_grad = False
+            self.maxpool.requires_grad =False
+
+        for i in range(1, self.frozen_stages + 1):
+            m = getattr(self, f'layer{i}')
+            m.eval()
+            for param in m.parameters():
+                param.requires_grad = False
+
     def init_weights(self, pretrained=None):
         if isinstance(pretrained, str):
             logger = get_root_logger()
@@ -267,38 +283,11 @@ class ResNet_blur(nn.Module):
 
         return out
 
-
-# def resnet18_blur(pretrained=False, filter_size=1, pool_only=True, **kwargs):
-#     """Constructs a ResNet-18 model.
-#     Args:
-#         pretrained (bool): If True, returns a model pre-trained on ImageNet
-#     """
-#     model = ResNet(BasicBlock, [2, 2, 2, 2], filter_size=filter_size, pool_only=pool_only, **kwargs)
-#     return model
-
-
-# def resnet34_blur(pretrained=False, filter_size=1, pool_only=True, **kwargs):
-#     """Constructs a ResNet-34 model.
-#     Args:
-#         pretrained (bool): If True, returns a model pre-trained on ImageNet
-#     """
-#     model = ResNet(BasicBlock, [3, 4, 6, 3], filter_size=filter_size, pool_only=pool_only, **kwargs)
-#     return model
-
-
-# def resnet50_blur(pretrained=False, filter_size=1, pool_only=True, **kwargs):
-#     """Constructs a ResNet-50 model.
-#     Args:
-#         pretrained (bool): If True, returns a model pre-trained on ImageNet
-#     """
-#     model = ResNet(Bottleneck, [3, 4, 6, 3], filter_size=filter_size, pool_only=pool_only, **kwargs)
-#     return model
-
-
-# def resnet101_blur(pretrained=False, filter_size=1, pool_only=True, **kwargs):
-#     """Constructs a ResNet-101 model.
-#     Args:
-#         pretrained (bool): If True, returns a model pre-trained on ImageNet
-#     """
-#     model = ResNet(Bottleneck, [3, 4, 23, 3], filter_size=filter_size, pool_only=pool_only, **kwargs)
-#     return model
+    def train(self, mode=True):
+        super(ResNet_ds, self).train(mode)
+        self._freeze_stages()
+        if mode and self.norm_eval:
+            for m in self.modules():
+                # trick: eval have effect on BatchNorm only
+                if isinstance(m, _BatchNorm):
+                    m.eval()

@@ -5,15 +5,17 @@ import numpy as np
 import time
 from mmdet.utils import get_root_logger
 from mmcv.runner import load_checkpoint
+from torch.nn.modules.batchnorm import _BatchNorm
 
 from ..builder import BACKBONES
 
 class even_Downsample(nn.Module):
-    def __init__(self, channels, filt_size=3, stride=2):
+    def __init__(self, channels, filt_size=3, stride=2, filt_requires_grad = False):
         super(even_Downsample, self).__init__()
         self.filt_size = filt_size
         self.stride = stride
         self.channels = channels
+        self.filt_requires_grad = filt_requires_grad
 
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Sequential(
@@ -21,28 +23,17 @@ class even_Downsample(nn.Module):
             nn.ReLU()
         )
         self.fc2 = nn.Sequential(
-            nn.Conv2d(channels, 4*channels, kernel_size = 1),
+            nn.Conv2d(channels, 4*channels, kernel_size=1),
             nn.Sigmoid()
         )
 
-        if(self.filt_size==1):
-            a = np.array([1.,])
-        elif(self.filt_size==2):
-            a = np.array([1., 1.])
-        elif(self.filt_size==3):
-            a = np.array([1., 2., 1.])
-        elif(self.filt_size==4):    
-            a = np.array([1., 3., 3., 1.])
-        elif(self.filt_size==5):    
-            a = np.array([1., 4., 6., 4., 1.])
-        elif(self.filt_size==6):    
-            a = np.array([1., 5., 10., 10., 5., 1.])
-        elif(self.filt_size==7):    
-            a = np.array([1., 6., 15., 20., 15., 6., 1.])
-            
+        a = np.array([1., 2., 1.])
         filt = torch.Tensor(a[:,None]*a[None,:])
-        filt = filt/torch.sum(filt)
-        self.register_buffer('filt', filt[None,None,:,:].repeat((4*channels,1,1,1)))
+        if filt_requires_grad:
+            self._filt = nn.Parameter(filt[None,None,:,:].repeat((4*self.channels,1,1,1)))
+        else:
+            filt = filt/torch.sum(filt)
+            self.register_buffer('filt', filt[None,None,:,:].repeat((4*self.channels,1,1,1)))
 
     def forward(self, x):
         b,c,h,w = x.size()
@@ -50,8 +41,11 @@ class even_Downsample(nn.Module):
         part2 = F.pad(x,(1,0,0,1),mode = "reflect")
         part3 = F.pad(x,(0,1,1,0),mode = "reflect")
         part4 = F.pad(x,(0,1,0,1),mode = "reflect")
-
         x = torch.cat((part1,part2,part3,part4),1)
+
+        if self.filt_requires_grad:
+            self.filt = self._filt / torch.sum(self._filt, dim=(1,2,3), keepdim=True)
+            
         x = F.conv2d(x, self.filt, stride=2, groups=4*c) 
         x = x.reshape(b, 4, c, h//2, w//2)
         x = x.permute(0, 2, 1, 3, 4)
@@ -80,7 +74,7 @@ class BasicBlock(nn.Module):
     expansion = 1
 
     def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
+                 base_width=64, dilation=1, norm_layer=None, filt_requires_grad=False):
         super(BasicBlock, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -95,7 +89,7 @@ class BasicBlock(nn.Module):
         if(stride==1):
             self.conv2 = conv3x3(planes,planes)
         else:
-            self.conv2 = nn.Sequential(even_Downsample(planes, filt_size=3, stride=stride),
+            self.conv2 = nn.Sequential(even_Downsample(planes, filt_size=3, stride=stride, filt_requires_grad=filt_requires_grad),
                 conv3x3(planes, planes),)
         self.bn2 = norm_layer(planes)
         self.downsample = downsample
@@ -124,7 +118,7 @@ class Bottleneck(nn.Module):
     expansion = 4
 
     def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
+                 base_width=64, dilation=1, norm_layer=None, filt_requires_grad=False):
         super(Bottleneck, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -133,7 +127,7 @@ class Bottleneck(nn.Module):
         self.conv1 = conv1x1(inplanes, width)
         self.bn1 = norm_layer(width)
         if stride == 2:
-            self.conv2 = even_Downsample(channels=width, filt_size=3, stride = stride)
+            self.conv2 = even_Downsample(channels=width, filt_size=3, stride = stride, filt_requires_grad=filt_requires_grad)
         else:
             self.conv2 = conv3x3(width, width, stride, groups, dilation)
         self.bn2 = norm_layer(width)
@@ -168,7 +162,7 @@ class Bottleneck(nn.Module):
 @BACKBONES.register_module()
 class ResNet_ds(nn.Module):
 
-    def __init__(self, depth, zero_init_residual=False, groups=1, width_per_group=64, replace_stride_with_dilation=None, norm_layer=None):
+    def __init__(self, depth, norm_eval=True, frozen_stages=-1, zero_init_residual=False, groups=1, width_per_group=64, replace_stride_with_dilation=None, norm_layer=None, filt_requires_grad=False):
         super(ResNet_ds, self).__init__()
         if depth == 18:
             block = BasicBlock
@@ -184,6 +178,8 @@ class ResNet_ds(nn.Module):
             layers = [3, 4, 23, 3]
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
+        self.norm_eval = norm_eval
+        self.frozen_stages = frozen_stages
         self._norm_layer = norm_layer
         self.zero_init_residual = zero_init_residual
         self.inplanes = 64
@@ -202,16 +198,29 @@ class ResNet_ds(nn.Module):
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         # self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.maxpool = even_Downsample(self.inplanes, filt_size = 3, stride = 2)
+        self.maxpool = even_Downsample(self.inplanes, filt_size = 3, stride = 2, filt_requires_grad=filt_requires_grad)
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
-                                       dilate=replace_stride_with_dilation[0])
+                                       dilate=replace_stride_with_dilation[0], filt_requires_grad=filt_requires_grad)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
-                                       dilate=replace_stride_with_dilation[1])
+                                       dilate=replace_stride_with_dilation[1], filt_requires_grad=filt_requires_grad)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
-                                       dilate=replace_stride_with_dilation[2])
+                                       dilate=replace_stride_with_dilation[2], filt_requires_grad=filt_requires_grad)
         # self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         # self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self._freeze_stages()
+
+    def _freeze_stages(self):
+        if self.frozen_stages >= 0:
+            self.conv1.requires_grad = False
+            self.maxpool.requires_grad =False
+
+        for i in range(1, self.frozen_stages + 1):
+            m = getattr(self, f'layer{i}')
+            m.eval()
+            for param in m.parameters():
+                param.requires_grad = False
+
 
     def init_weights(self, pretrained=None):
         if isinstance(pretrained, str):
@@ -236,7 +245,7 @@ class ResNet_ds(nn.Module):
                 elif isinstance(m, BasicBlock):
                     nn.init.constant_(m.bn2.weight, 0)
 
-    def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+    def _make_layer(self, block, planes, blocks, stride=1, dilate=False,filt_requires_grad=False):
         norm_layer = self._norm_layer
         downsample = None
         previous_dilation = self.dilation
@@ -246,20 +255,19 @@ class ResNet_ds(nn.Module):
         if self.inplanes != planes * block.expansion:
             if stride != 1:
                 downsample = nn.Sequential(
-                    even_Downsample(self.inplanes, filt_size=3, stride=2),
-                    norm_layer(self.inplanes,),
+                    even_Downsample(self.inplanes, filt_size=3, stride=2,filt_requires_grad=filt_requires_grad),
                     conv1x1(self.inplanes, planes * block.expansion, 1),
                     norm_layer(planes * block.expansion),
                 )
             else:
                 downsample = nn.Sequential(
-                    conv1x1(self.inplanes, planes * block.expansion, stride),
+                    conv1x1(self.inplanes, planes * block.expansion, 1),
                     norm_layer(planes * block.expansion),
                 )
 
         layers = []
         layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
-                            self.base_width, previous_dilation, norm_layer))
+                            self.base_width, previous_dilation, norm_layer, filt_requires_grad))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
             layers.append(block(self.inplanes, planes, groups=self.groups,
@@ -286,23 +294,11 @@ class ResNet_ds(nn.Module):
 
         return out
 
-# def _resnet(arch, block, layers, **kwargs):
-#     model = ResNet_ds(block, layers, **kwargs)
-#     return model
-
-# @BACKBONES.register_module()
-# def resnet18_ds(**kwargs):
-#     return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], **kwargs)
-
-# @BACKBONES.register_module()
-# def resnet34_ds( **kwargs):
-#     return _resnet('resnet34', BasicBlock, [3, 4, 6, 3], **kwargs)
-
-# @BACKBONES.register_module()
-# def resnet50_ds(**kwargs):
-#     return _resnet('resnet50', Bottleneck, [3, 4, 6, 3], **kwargs)
-
-# # @BACKBONES.register_module()
-# def resnet101_ds(**kwargs):
-#     return _resnet('resnet101', Bottleneck, [3, 4, 23, 3], **kwargs)
-
+    def train(self, mode=True):
+        super(ResNet_ds, self).train(mode)
+        self._freeze_stages()
+        if mode and self.norm_eval:
+            for m in self.modules():
+                # trick: eval have effect on BatchNorm only
+                if isinstance(m, _BatchNorm):
+                    m.eval()
